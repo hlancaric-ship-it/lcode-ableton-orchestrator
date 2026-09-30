@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.DS_Store
+.wrangler/
+# Puvodni AbletonOSC (vlastni git repo) - nase upravy jsou v abletonosc_patches/
+AbletonOSC_reference/

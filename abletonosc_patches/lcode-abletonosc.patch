@@ -1,0 +1,85 @@
+--- a/abletonosc/application.py
++++ b/abletonosc/application.py
+@@ -18,3 +18,36 @@
+             return application.average_process_usage,
+         self.osc_server.add_handler("/live/application/get/average_process_usage", get_average_process_usage)
+         self.osc_server.send("/live/application/get/average_process_usage")
++
++        # L-Code addition: lists the browsable children of a named item (e.g.
++        # a plugin's factory presets, if Live indexes them) so preset names
++        # can be discovered before insert_device() is used to load one.
++        def _find_browser_child(root, name):
++            """Direct-child lookup by name, for path navigation -- unlike
++            insert_device's recursive _find_browser_item, this does NOT
++            require is_loadable (folders like 'VST3' aren't loadable, only
++            leaf devices/presets are) and only looks one level down."""
++            for child in root.children:
++                if child.name == name:
++                    return child
++            return None
++
++        def browse_children(params: Tuple) -> Tuple:
++            path = list(params)
++            browser = Live.Application.get_application().browser
++            roots = {
++                "audio_effects": browser.audio_effects, "instruments": browser.instruments,
++                "drums": browser.drums, "max_for_live": browser.max_for_live, "plugins": browser.plugins,
++                "sounds": browser.sounds, "user_library": browser.user_library,
++            }
++            root_name = path[0]
++            item = roots.get(root_name)
++            if item is None:
++                return ("error", f"unknown browser root {root_name!r}")
++            for name in path[1:]:
++                item = _find_browser_child(item, name)
++                if item is None:
++                    return ("error", f"not found: {name!r} under {path}")
++            return tuple(child.name for child in item.children)
++
++        self.osc_server.add_handler("/live/browser/children", browse_children)
+--- a/abletonosc/track.py
++++ b/abletonosc/track.py
+@@ -1,5 +1,6 @@
+ from typing import Tuple, Any, Callable, Optional
+ from .handler import AbletonOSCHandler
++import Live
+ 
+ 
+ class TrackHandler(AbletonOSCHandler):
+@@ -102,6 +103,36 @@
+         self.osc_server.add_handler("/live/track/get/send", create_track_callback(track_get_send))
+         self.osc_server.add_handler("/live/track/set/send", create_track_callback(track_set_send))
+ 
++        # L-Code addition: AbletonOSC upstream can only control devices already
++        # on a track (num_devices/get/devices/*), not insert new ones -- there's
++        # no browser exposed over OSC at all. This adds exactly that, using the
++        # same Live.Application.browser + load_item() mechanism the Live UI
++        # itself uses for double-click/drag-load from the device browser.
++        def _find_browser_item(root, name):
++            if root.name == name and root.is_loadable:
++                return root
++            for child in root.children:
++                found = _find_browser_item(child, name)
++                if found is not None:
++                    return found
++            return None
++
++        def track_insert_device(track, params: Tuple[Any]):
++            device_name, = params
++            app = Live.Application.get_application()
++            browser = app.browser
++            item = None
++            for root in (browser.audio_effects, browser.instruments, browser.drums, browser.max_for_live, browser.plugins):
++                item = _find_browser_item(root, device_name)
++                if item is not None:
++                    break
++            if item is None:
++                raise Exception("insert_device: %r not found in browser (Audio Effects/Instruments/Drums/M4L)" % device_name)
++            self.song.view.selected_track = track
++            app.browser.load_item(item)
++
++        self.osc_server.add_handler("/live/track/insert_device", create_track_callback(track_insert_device))
++
+         def track_delete_clip(track, params: Tuple[Any]):
+             clip_index, = params
+             track.clip_slots[clip_index].delete_clip()
