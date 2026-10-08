@@ -17,7 +17,7 @@ on each track. This builds correct MIDI content and structure, not sound.
 import time
 from dataclasses import dataclass, field
 
-from lcode_orchestrator import LCodeOrchestrator
+from lcode_orchestrator import LCodeOrchestrator, LCodeOrchestratorError
 from techno_gen import TechnoGenEngine
 
 # --- Track roles -> track NAME (resolved to a live index via resolve_tracks(),
@@ -196,11 +196,12 @@ SECTIONS = [
 ]
 
 
-def print_song_map():
-    total_bars = sum(s.bars for s in SECTIONS)
-    print(f"\n=== TECH HOUSE ARRANGEMENT ({len(SECTIONS)} scenes, {total_bars} bars @ 120 BPM ~= "
-          f"{total_bars * BEATS_PER_BAR * 60 / 120 / 60:.1f} min) ===")
-    for i, s in enumerate(SECTIONS):
+def print_song_map(sections: list[Section] | None = None, bpm: float = 120, title: str = "TECH HOUSE"):
+    sections = sections or SECTIONS
+    total_bars = sum(s.bars for s in sections)
+    print(f"\n=== {title} ARRANGEMENT ({len(sections)} scenes, {total_bars} bars @ {bpm:g} BPM ~= "
+          f"{total_bars * BEATS_PER_BAR * 60 / bpm / 60:.1f} min) ===")
+    for i, s in enumerate(sections):
         roles = sorted(set(s.rhythmic) | set(s.melodic))
         print(f"  [{i}] {s.name:10s} {s.bars:3d} bars  -- {', '.join(roles)}")
     print("=== end song map ===\n")
@@ -216,14 +217,17 @@ def write_melodic_clip(client, track_idx: int, slot_idx: int, bars: int, hits: l
         client.send_message("/live/clip/add/notes", [track_idx, slot_idx, note, start, dur, vel, 0])
 
 
-def build(orch: LCodeOrchestrator):
+def build(orch: LCodeOrchestrator, sections: list[Section] | None = None, tempo: float | None = None):
     """Creates one Scene per section and writes all clip content. Idempotent
     per role -- clip_slot/delete_clip runs first so re-running replaces
     content rather than layering duplicates."""
+    sections = sections or SECTIONS
     engine = TechnoGenEngine(orch)
     tracks = resolve_tracks(orch)
+    if tempo:
+        orch.client.send_message("/live/song/set/tempo", [float(tempo)])
 
-    for scene_idx, section in enumerate(SECTIONS):
+    for scene_idx, section in enumerate(sections):
         orch.client.send_message("/live/song/create_scene", [scene_idx])
         time.sleep(0.2)
         orch.client.send_message("/live/scene/set/name", [scene_idx, section.name])
@@ -240,30 +244,115 @@ def build(orch: LCodeOrchestrator):
         print(f"-- scene [{scene_idx}] {section.name} done --\n")
 
 
-def print_to_arrangement(orch: LCodeOrchestrator):
+def copy_to_arrangement(orch: LCodeOrchestrator, sections: list[Section] | None = None,
+                        clear: bool = True) -> dict:
+    """
+    Deterministic Session -> Arrangement: copies every scene's clips to its
+    exact bar position via Track.duplicate_clip_to_arrangement (L-Code
+    AbletonOSC patch). Instant, no transport timing involved -- preferred
+    over print_to_arrangement(). clear=True first wipes the Arrangement on
+    the builder's tracks, so re-running replaces instead of layering.
+    Returns {track_name: clips_copied}.
+    """
+    sections = sections or SECTIONS
+    q = orch._query
+    names = list(q("/live/song/get/track_names", []))
+    missing = [n for n in TRACK_NAMES.values() if n not in names]
+    if missing:
+        raise ValueError(f"Tracks not found in live set: {missing}")
+    idx = {n: names.index(n) for n in TRACK_NAMES.values()}
+
+    if clear:
+        for name, t in idx.items():
+            q("/live/track/clear_arrangement", [t])
+
+    copied = {n: 0 for n in idx}
+    pos = 0.0
+    for scene_idx, section in enumerate(sections):
+        for role in set(section.rhythmic) | set(section.melodic):
+            name = TRACK_NAMES[role]
+            orch.client.send_message("/live/track/duplicate_clip_to_arrangement", [idx[name], scene_idx, pos])
+            copied[name] += 1
+        pos += section.bars * BEATS_PER_BAR
+    time.sleep(0.5)
+
+    # Verify against what Live actually holds, not what was sent.
+    for name, t in idx.items():
+        got = len(q("/live/track/get/arrangement_clips/start_time", [t])) - 1
+        if got != copied[name]:
+            raise LCodeOrchestratorError(f"{name}: v Arrangementu {got} klipu, ocekavano {copied[name]}")
+    return copied
+
+
+def print_to_arrangement(orch: LCodeOrchestrator, sections: list[Section] | None = None,
+                         count: int | None = None):
     """
     Bakes the Session scenes into the Arrangement timeline in order, by
-    enabling arrangement record and launching each scene for exactly its
-    bar length -- this is the only way AbletonOSC content ends up in
-    Arrangement (there's no direct 'write clip to arrangement' call).
-    Real-time: takes as long as the song itself to run.
+    enabling arrangement record and launching each scene at its bar boundary
+    -- the only way AbletonOSC content ends up in Arrangement (there's no
+    direct 'write clip to arrangement' call). Real-time: takes as long as the
+    song itself.
+
+    Sync is driven by Live's own song position, not by sleep(): launch
+    quantization is set to 1 bar and each next scene is fired half a bar
+    before its boundary, so it lands exactly on the bar with no drift.
     """
-    tempo = orch._query("/live/song/get/tempo", [])[0]
-    seconds_per_beat = 60.0 / tempo
+    sections = list(sections or SECTIONS)[:count]  # count: re-print only the first N sections
+    q = orch._query
+    boundaries, pos = [], 0.0
+    for section in sections:
+        boundaries.append(pos)
+        pos += section.bars * BEATS_PER_BAR
+    total = pos
+    lead = BEATS_PER_BAR / 2  # fire half a bar early; quantization snaps it to the boundary
 
-    orch.client.send_message("/live/song/set/record_mode", [1])
-    orch.client.send_message("/live/song/set/current_song_time", [0])
-    orch.client.send_message("/live/song/start_playing", [])
-    time.sleep(0.3)
+    old_quant = q("/live/song/get/clip_trigger_quantization", [])[-1]
 
-    for scene_idx, section in enumerate(SECTIONS):
-        orch.client.send_message("/live/scene/fire", [scene_idx])
-        wait_seconds = section.bars * BEATS_PER_BAR * seconds_per_beat
-        print(f"printing [{scene_idx}] {section.name} ({section.bars} bars, {wait_seconds:.1f}s)...")
-        time.sleep(wait_seconds)
+    def song_time() -> float:
+        return float(q("/live/song/get/current_song_time", [])[-1])
 
-    orch.client.send_message("/live/song/stop_playing", [])
-    orch.client.send_message("/live/song/set/record_mode", [0])
+    def wait_until(beat: float):
+        last, stalled_since = -1.0, time.time()
+        while True:
+            now = song_time()
+            if now >= beat:
+                return
+            if now != last:
+                last, stalled_since = now, time.time()
+            elif time.time() - stalled_since > 5:
+                raise LCodeOrchestratorError(f"Transport stoji na beatu {now} - nahravani preruseno")
+            time.sleep(0.05)
+
+    try:
+        orch.client.send_message("/live/song/stop_playing", [])
+        time.sleep(0.3)
+        # First scene unquantized: with 1-bar quantization a scene fired from a
+        # stopped transport lands on bar 2 (beat 4), losing the first bar.
+        orch.client.send_message("/live/song/set/clip_trigger_quantization", [0])
+        orch.client.send_message("/live/song/set/current_song_time", [0.0])
+        orch.client.send_message("/live/song/set/record_mode", [1])
+        time.sleep(0.3)
+        orch.client.send_message("/live/scene/fire", [0])  # starts transport, launches at beat 0
+        time.sleep(0.5)
+        orch.client.send_message("/live/song/set/clip_trigger_quantization", [4])  # 1 bar from here on
+        print(f"printing [0] {sections[0].name} ({sections[0].bars} bars)...")
+
+        for scene_idx in range(1, len(sections)):
+            wait_until(boundaries[scene_idx] - lead)
+            orch.client.send_message("/live/scene/fire", [scene_idx])
+            print(f"printing [{scene_idx}] {sections[scene_idx].name} ({sections[scene_idx].bars} bars) "
+                  f"@ beat {boundaries[scene_idx]:g}...")
+
+        wait_until(total - lead)
+        orch.client.send_message("/live/song/stop_all_clips", [])  # quantized -> stops on the last bar line
+        wait_until(total + 0.5)
+    finally:
+        orch.client.send_message("/live/song/stop_playing", [])
+        orch.client.send_message("/live/song/set/record_mode", [0])
+        orch.client.send_message("/live/song/set/clip_trigger_quantization", [old_quant])
+        time.sleep(0.3)
+        orch.client.send_message("/live/song/set/back_to_arranger", [0])  # Arrangement plays again, not Session
+        orch.client.send_message("/live/song/set/current_song_time", [0.0])
     print("Printed to Arrangement.")
 
 
