@@ -83,3 +83,13 @@
   každé úpravě `abletonosc/*.py` souborů v Remote Scripts -- vždy nejdřív
   uložit projekt (Cmd+S), AbletonOSC restart neztratí projekt v paměti, ale
   jistota je jistota.
+- **ZÁVAZNÉ PRAVIDLO (Lucky, 13. 10. 2026): každý exportovaný/importovaný
+  WAV stem MUSÍ začínat přesně prvním kickem nebo první dobou (beat 1),
+  bez jakéhokoli leading silence/pickupu před ním.** Jinak jsou stemy mezi
+  sebou mimo fázi/sync, i když jsou na stejném tempu -- zarovnání v Ableton
+  Live (viz celá tahle session "Zarovnání stemů") pak nejde spolehlivě
+  udělat, protože vizuální/transientové zarovnání počítá s tím, že start
+  souboru == start hudby. Platí pro VŠECHNY stemy v projektu (kick, bass,
+  vokály, vše), ne jen pro bicí. Při kontrole/opravě stemů vždy nejdřív
+  ověřit transient na sample 0 (nebo co nejblíž), ne věřit názvu/metadatům
+  souboru.
