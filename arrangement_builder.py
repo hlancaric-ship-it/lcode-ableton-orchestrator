@@ -15,7 +15,7 @@ on each track. This builds correct MIDI content and structure, not sound.
 """
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from lcode_orchestrator import LCodeOrchestrator, LCodeOrchestratorError
 from techno_gen import TechnoGenEngine
@@ -67,6 +67,12 @@ class Section:
     rhythmic: dict = field(default_factory=dict)
     # role -> list of (start_beat, note, duration_beats, velocity) (melodic/chord tracks)
     melodic: dict = field(default_factory=dict)
+    # ticho na úplném konci sekce (v dobách) -- pauza těsně před dalším dílem
+    gap_beats: float = 0.0
+    # indexy taktů (od 0), kde v dobách 3-4 vypadne basa/lead/harmonie ("nádech" ve frázi)
+    breaths: list = field(default_factory=list)
+    # extra hity na track "FX Risers": (start_beat, note, duration_beats, velocity)
+    fx_hits: list = field(default_factory=list)
 
 
 def chord_hits(root_notes: list[int], bars: int, beats_per_hit: float = 4.0,
@@ -85,6 +91,83 @@ def chord_hits(root_notes: list[int], bars: int, beats_per_hit: float = 4.0,
 def riser_hit(bars: int, note: int = 60, velocity: int = 100) -> list[tuple]:
     """One long swelling note spanning the whole section -- placeholder for an FX riser."""
     return [(0.0, note, bars * BEATS_PER_BAR - 0.1, velocity)]
+
+
+# --- Pauzy a efekty ---------------------------------------------------------
+# Track "FX Risers" je Drum Rack: jeden pad = jeden efekt (C1 = 36). Pitched riser
+# z riser_hit() (60/64/67) zůstává na vlastních notách, s padama se nepere.
+FX_IMPACT, FX_REV_CRASH, FX_DOWNLIFT, FX_SWEEP, FX_SHOUT = 36, 37, 38, 39, 40
+
+# V "nádechu" mlčí jen tyhle role; kick, clap a hats drží groove.
+BREATH_ROLES = {"sub_bass", "mid_bass", "synth_lead", "piano_guitar", "backing_vox", "pads"}
+
+
+def section_cuts(section: Section) -> list[tuple]:
+    """Okna ticha jako (start_beat, end_beat, roles); roles=None = všechny role."""
+    end = section.bars * BEATS_PER_BAR
+    cuts = []
+    if section.gap_beats:
+        cuts.append((end - section.gap_beats, end, None))
+    for bar in section.breaths:
+        cuts.append((bar * BEATS_PER_BAR + 2.0, (bar + 1) * BEATS_PER_BAR, BREATH_ROLES))
+    return cuts
+
+
+def cut_hits(hits: list[tuple], start: float, end: float) -> list[tuple]:
+    """Vyhodí noty začínající v okně [start, end) a zkrátí ty, co do něj zasahují."""
+    out = []
+    for h_start, note, dur, vel in hits:
+        if start <= h_start < end:
+            continue
+        if h_start < start < h_start + dur:
+            dur = start - h_start
+        out.append((h_start, note, dur, vel))
+    return out
+
+
+def remove_window(client, track_idx: int, slot_idx: int, start: float, end: float):
+    """Smaže noty začínající v okně [start, end) z už zapsaného clipu (rytmické role)."""
+    client.send_message("/live/clip/remove/notes", [track_idx, slot_idx, 0, 127, start, end - start])
+
+
+def plan_transitions(sections: list[Section]) -> list[Section]:
+    """Doplní pauzy a efekty podle názvů sekcí (Intro / Build* / Groove* / Break* / Drop* / Outro).
+    Co už má sekce vyplněné ručně (gap_beats, breaths, fx_hits), nepřepisuje."""
+    out = []
+    for i, s in enumerate(sections):
+        nxt = sections[i + 1].name if i + 1 < len(sections) else None
+        beats = s.bars * BEATS_PER_BAR
+        hot = s.name.startswith(("Drop", "Groove"))
+        gap = s.gap_beats
+        breaths = list(s.breaths)
+        fx = list(s.fx_hits)
+
+        if not gap and nxt and nxt.startswith("Drop"):
+            gap = 1.0  # zastavení na poslední době před dropem
+        if not breaths and hot and s.bars >= 16:
+            breaths = list(range(7, s.bars - 1, 8))  # poslední takt sekce se nechává celý
+
+        if not fx:
+            if i > 0:
+                if s.name.startswith("Drop"):
+                    fx.append((0.0, FX_IMPACT, 4.0, 120))
+                elif s.name.startswith("Groove"):
+                    fx.append((0.0, FX_IMPACT, 4.0, 100))
+                elif s.name.startswith(("Break", "Outro")):
+                    fx.append((0.0, FX_DOWNLIFT, min(16.0, beats), 100))
+            if nxt:
+                fx.append((beats - 4.0, FX_REV_CRASH, 4.0, 100))
+                if not s.name.startswith(("Build", "Break")) and s.bars >= 4:
+                    fx.append((beats - 8.0, FX_SWEEP, 8.0, 90))
+            if hot:
+                for bar in range(8, s.bars, 8):  # začátek každé další 8taktové fráze
+                    fx.append((bar * BEATS_PER_BAR, FX_IMPACT, 4.0, 80))
+                if s.name.startswith("Drop"):
+                    for bar in breaths:  # místo pro vocal shout v nádechu
+                        fx.append((bar * BEATS_PER_BAR + 2.0, FX_SHOUT, 1.0, 100))
+
+        out.append(replace(s, gap_beats=gap, breaths=breaths, fx_hits=fx))
+    return out
 
 
 # --- Song structure (16-bar sections unless noted) --------------------------
@@ -203,7 +286,15 @@ def print_song_map(sections: list[Section] | None = None, bpm: float = 120, titl
           f"{total_bars * BEATS_PER_BAR * 60 / bpm / 60:.1f} min) ===")
     for i, s in enumerate(sections):
         roles = sorted(set(s.rhythmic) | set(s.melodic))
-        print(f"  [{i}] {s.name:10s} {s.bars:3d} bars  -- {', '.join(roles)}")
+        extras = []
+        if s.gap_beats:
+            extras.append(f"pauza {s.gap_beats:g} doby na konci")
+        if s.breaths:
+            extras.append("nádech v taktech " + ", ".join(str(b + 1) for b in s.breaths))
+        if s.fx_hits:
+            extras.append(f"{len(s.fx_hits)} FX")
+        print(f"  [{i}] {s.name:10s} {s.bars:3d} bars  -- {', '.join(roles)}"
+              + (f"  | {'; '.join(extras)}" if extras else ""))
     print("=== end song map ===\n")
 
 
@@ -217,11 +308,15 @@ def write_melodic_clip(client, track_idx: int, slot_idx: int, bars: int, hits: l
         client.send_message("/live/clip/add/notes", [track_idx, slot_idx, note, start, dur, vel, 0])
 
 
-def build(orch: LCodeOrchestrator, sections: list[Section] | None = None, tempo: float | None = None):
+def build(orch: LCodeOrchestrator, sections: list[Section] | None = None, tempo: float | None = None,
+          transitions: bool = True):
     """Creates one Scene per section and writes all clip content. Idempotent
     per role -- clip_slot/delete_clip runs first so re-running replaces
-    content rather than layering duplicates."""
+    content rather than layering duplicates. transitions=True doplní pauzy,
+    nádechy a FX hity přes plan_transitions()."""
     sections = sections or SECTIONS
+    if transitions:
+        sections = plan_transitions(sections)
     engine = TechnoGenEngine(orch)
     tracks = resolve_tracks(orch)
     if tempo:
@@ -232,13 +327,28 @@ def build(orch: LCodeOrchestrator, sections: list[Section] | None = None, tempo:
         time.sleep(0.2)
         orch.client.send_message("/live/scene/set/name", [scene_idx, section.name])
 
+        cuts = section_cuts(section)
+
         for role, kwargs in section.rhythmic.items():
             track_idx = tracks[role]
             engine.generate_techno_pattern(track_idx=track_idx, slot_idx=scene_idx,
                                             bars=section.bars, **kwargs)
+            windows = [(a, b) for a, b, roles in cuts if roles is None or role in roles]
+            if windows:
+                time.sleep(0.3)  # nejdřív ať Live zpracuje zapsané noty, pak teprve mazání
+                for a, b in windows:
+                    remove_window(orch.client, track_idx, scene_idx, a, b)
 
-        for role, hits in section.melodic.items():
+        melodic = dict(section.melodic)
+        if section.fx_hits:
+            melodic.setdefault("fx", [])
+        for role, hits in melodic.items():
             track_idx = tracks[role]
+            for a, b, roles in cuts:
+                if roles is None or role in roles:
+                    hits = cut_hits(hits, a, b)
+            if role == "fx":
+                hits = hits + list(section.fx_hits)  # FX hity pauzu neřežou, reverse crash do ní běží
             write_melodic_clip(orch.client, track_idx, scene_idx, section.bars, hits)
 
         print(f"-- scene [{scene_idx}] {section.name} done --\n")
