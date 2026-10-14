@@ -73,6 +73,8 @@ class Section:
     breaths: list = field(default_factory=list)
     # extra hity na track "FX Risers": (start_beat, note, duration_beats, velocity)
     fx_hits: list = field(default_factory=list)
+    # extra kicky (double kick, kick roll) na track "Kick 808 Bass": (start_beat, note, duration_beats, velocity)
+    kick_extra: list = field(default_factory=list)
 
 
 def chord_hits(root_notes: list[int], bars: int, beats_per_hit: float = 4.0,
@@ -97,6 +99,7 @@ def riser_hit(bars: int, note: int = 60, velocity: int = 100) -> list[tuple]:
 # Track "FX Risers" je Drum Rack: jeden pad = jeden efekt (C1 = 36). Pitched riser
 # z riser_hit() (60/64/67) zůstává na vlastních notách, s padama se nepere.
 FX_IMPACT, FX_REV_CRASH, FX_DOWNLIFT, FX_SWEEP, FX_SHOUT = 36, 37, 38, 39, 40
+KICK_NOTE = 36  # kick na tracku "Kick 808 Bass" (stejné C1 jako generátor patternů)
 
 # V "nádechu" mlčí jen tyhle role; kick, clap a hats drží groove.
 BREATH_ROLES = {"sub_bass", "mid_bass", "synth_lead", "piano_guitar", "backing_vox", "pads"}
@@ -125,6 +128,14 @@ def cut_hits(hits: list[tuple], start: float, end: float) -> list[tuple]:
     return out
 
 
+def role_hits(hits: list[tuple], cuts: list[tuple], role: str) -> list[tuple]:
+    """Aplikuje na hity jedné role všechna okna ticha, která se jí týkají."""
+    for a, b, roles in cuts:
+        if roles is None or role in roles:
+            hits = cut_hits(hits, a, b)
+    return hits
+
+
 def remove_window(client, track_idx: int, slot_idx: int, start: float, end: float):
     """Smaže noty začínající v okně [start, end) z už zapsaného clipu (rytmické role)."""
     client.send_message("/live/clip/remove/notes", [track_idx, slot_idx, 0, 127, start, end - start])
@@ -141,6 +152,19 @@ def plan_transitions(sections: list[Section]) -> list[Section]:
         gap = s.gap_beats
         breaths = list(s.breaths)
         fx = list(s.fx_hits)
+        kick = list(s.kick_extra)
+
+        if not kick:
+            if hot:  # double kick: 16tina před 4. dobou + osminový offbeat na konci každé 4taktové fráze
+                for bar in range(3, s.bars, 4):
+                    base = bar * BEATS_PER_BAR
+                    kick += [(base + 2.75, KICK_NOTE, 0.2, 100), (base + 3.5, KICK_NOTE, 0.2, 90)]
+            elif s.name.startswith("Build") and nxt and nxt.startswith("Drop") and s.bars >= 2:
+                # kick roll do dropu: předposlední takt na doby, poslední na osminy (poslední doba = pauza)
+                base = (s.bars - 2) * BEATS_PER_BAR
+                kick += [(base + b, KICK_NOTE, 0.2, 80 + 5 * b) for b in range(4)]
+                base += BEATS_PER_BAR
+                kick += [(base + i * 0.5, KICK_NOTE, 0.2, 95 + 4 * i) for i in range(8)]
 
         if not gap and nxt and nxt.startswith("Drop"):
             gap = 1.0  # zastavení na poslední době před dropem
@@ -166,7 +190,7 @@ def plan_transitions(sections: list[Section]) -> list[Section]:
                     for bar in breaths:  # místo pro vocal shout v nádechu
                         fx.append((bar * BEATS_PER_BAR + 2.0, FX_SHOUT, 1.0, 100))
 
-        out.append(replace(s, gap_beats=gap, breaths=breaths, fx_hits=fx))
+        out.append(replace(s, gap_beats=gap, breaths=breaths, fx_hits=fx, kick_extra=kick))
     return out
 
 
@@ -293,6 +317,8 @@ def print_song_map(sections: list[Section] | None = None, bpm: float = 120, titl
             extras.append("nádech v taktech " + ", ".join(str(b + 1) for b in s.breaths))
         if s.fx_hits:
             extras.append(f"{len(s.fx_hits)} FX")
+        if s.kick_extra:
+            extras.append(f"{len(s.kick_extra)} extra kicků")
         print(f"  [{i}] {s.name:10s} {s.bars:3d} bars  -- {', '.join(roles)}"
               + (f"  | {'; '.join(extras)}" if extras else ""))
     print("=== end song map ===\n")
@@ -338,15 +364,18 @@ def build(orch: LCodeOrchestrator, sections: list[Section] | None = None, tempo:
                 time.sleep(0.3)  # nejdřív ať Live zpracuje zapsané noty, pak teprve mazání
                 for a, b in windows:
                     remove_window(orch.client, track_idx, scene_idx, a, b)
+            if role == "kick_bass":  # double kick přidat až po případné pauze, ať do ní nezasáhne
+                for start, note, dur, vel in role_hits(section.kick_extra, cuts, role):
+                    orch.client.send_message("/live/clip/add/notes", [track_idx, scene_idx, note, start, dur, vel, 0])
 
         melodic = dict(section.melodic)
         if section.fx_hits:
             melodic.setdefault("fx", [])
+        if section.kick_extra and "kick_bass" not in section.rhythmic:
+            melodic["kick_bass"] = list(section.kick_extra)  # např. kick roll v Buildu, kde jinak kick nehraje
         for role, hits in melodic.items():
             track_idx = tracks[role]
-            for a, b, roles in cuts:
-                if roles is None or role in roles:
-                    hits = cut_hits(hits, a, b)
+            hits = role_hits(hits, cuts, role)
             if role == "fx":
                 hits = hits + list(section.fx_hits)  # FX hity pauzu neřežou, reverse crash do ní běží
             write_melodic_clip(orch.client, track_idx, scene_idx, section.bars, hits)
